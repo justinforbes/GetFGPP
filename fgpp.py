@@ -1,73 +1,114 @@
 #!/usr/bin/env python3
-from ldap3 import ALL, Server, Connection, NTLM, extend, SUBTREE
-from dateutil.relativedelta import relativedelta as rd
 import argparse
+import ssl
 import time
+from ldap3 import Server, Connection, NTLM, SASL, GSSAPI, ALL, SUBTREE, Tls
+from ldap3.core.exceptions import LDAPException
+from dateutil.relativedelta import relativedelta as rd
 
-parser = argparse.ArgumentParser(description='Dump Fine Grained Password Polices')
-parser.add_argument('-u', '--username', help='username for LDAP', required=True)
-parser.add_argument('-p', '--password', help='password for LDAP (or LM:NT hash)', required=True)
-parser.add_argument('-l', '--ldapserver', help='LDAP server (or domain)', required=False)
-parser.add_argument('-d', '--domain', help='Domain', required=True)
+parser = argparse.ArgumentParser(description='Dump Fine Grained Password Policies')
+parser.add_argument('-u', '--username', help='LDAP username', required=False)
+parser.add_argument('-p', '--password', help='LDAP password (or hash)', required=False)
+parser.add_argument('-l', '--ldapserver', help='LDAP server (hostname or IP)', required=True)
+parser.add_argument('-d', '--domain', help='AD domain (e.g. corp.local)', required=True)
+parser.add_argument('--use-ldaps', help='Use LDAPS (SSL/TLS)', action='store_true')
+parser.add_argument('--kerberos', help='Use Kerberos (GSSAPI)', action='store_true')
+parser.add_argument('--port', help='Custom port (default 389 or 636)', type=int)
 
 def base_creator(domain):
-    search_base = ""
-    base = domain.split(".")
-    for b in base:
-        search_base += "DC=" + b + ","
-    return search_base[:-1]
+    return ','.join(f"DC={dc}" for dc in domain.split('.'))
 
 def clock(nano):
+    sec = int(abs(nano / 10_000_000))
     fmt = '{0.days} days {0.hours} hours {0.minutes} minutes {0.seconds} seconds'
-    sec = int(abs(nano/10000000))
     return fmt.format(rd(seconds=sec))
+
+def connect(args):
+    use_ssl = args.use_ldaps
+    port = args.port or (636 if use_ssl else 389)
+
+    tls_config = Tls(validate=ssl.CERT_NONE)
+    server = Server(args.ldapserver, port=port, use_ssl=use_ssl, get_info=ALL, tls=tls_config if use_ssl else None)
+
+    try:
+        if args.kerberos:
+            print("[*] Using Kerberos authentication (GSSAPI)...")
+            conn = Connection(
+                server,
+                authentication=SASL,
+                sasl_mechanism=GSSAPI,
+                auto_bind=True
+            )
+        else:
+            if not args.username or not args.password:
+                raise ValueError("Username and password required for NTLM authentication.")
+            user = f"{args.domain}\\{args.username}"
+            print(f"[*] Using NTLM authentication for user {user}...")
+            conn = Connection(
+                server,
+                user=user,
+                password=args.password,
+                authentication=NTLM,
+                auto_bind=True
+            )
+        print("[+] LDAP bind successful.\n")
+        return conn
+    except LDAPException as e:
+        print(f"[-] LDAP bind failed: {e}")
+        exit(1)
+
+def enumerate_fgpp(conn, domain):
+    base = base_creator(domain)
+    fgpp_base = f"CN=Password Settings Container,CN=System,{base}"
+
+    print("[*] Searching for Fine Grained Password Policies...\n")
+    conn.search(search_base=fgpp_base, search_filter='(objectClass=msDS-PasswordSettings)', attributes=['*'])
+
+    if not conn.entries:
+        print("[-] No FGPP policies found.")
+        return
+
+    print(f"[+] {len(conn.entries)} FGPP policies found.\n")
+
+    for entry in conn.entries:
+        print("Policy Name:", entry['name'])
+        if 'description' in entry and entry['description']:
+            print("Description:", entry['description'])
+        print("Minimum Password Length:", entry['msds-minimumpasswordlength'])
+        print("Password History Length:", entry['msds-passwordhistorylength'])
+        print("Lockout Threshold:", entry['msds-lockoutthreshold'])
+        print("Observation Window:", clock(int(entry['msds-lockoutobservationwindow'].value)))
+        print("Lockout Duration:", clock(int(entry['msds-lockoutduration'].value)))
+        print("Complexity Enabled:", entry['msds-passwordcomplexityenabled'])
+        print("Minimum Password Age:", clock(int(entry['msds-minimumpasswordage'].value)))
+        print("Maximum Password Age:", clock(int(entry['msds-maximumpasswordage'].value)))
+        print("Reversible Encryption:", entry['msds-passwordreversibleencryptionenabled'])
+        print("Precedence (lower = higher priority):", entry['msds-passwordsettingsprecedence'])
+
+        for target in entry['msds-psoappliesto']:
+            print("Policy Applies to:", target)
+        print("")
+
+def enumerate_applied_objects(conn, domain):
+    print("[*] Enumerating objects with FGPP applied...\n")
+    base = base_creator(domain)
+    conn.search(search_base=base, search_filter='(msDS-PSOApplied=*)',
+                attributes=['DistinguishedName', 'msDS-PSOApplied'])
+
+    if not conn.entries:
+        print("[-] No applied objects found.")
+        return
+
+    for entry in conn.entries:
+        print("Object:", entry['DistinguishedName'])
+        print("Applied Policy:", entry['msDS-PSOApplied'])
+        print("")
 
 def main():
     args = parser.parse_args()
-    if args.ldapserver:
-        s = Server(args.ldapserver, get_info=ALL)
-    else:
-        s = Server(args.domain, get_info=ALL)
-    print("Attempting to connect...\n")
-    c = Connection(s, user=args.domain + "\\" + args.username, password=args.password, authentication=NTLM,
-                   auto_bind=True)
-    print("Searching for Policy Objects...")
-    c.search(search_base='CN=Password Settings Container,CN=System,'+ base_creator(args.domain), search_filter='(objectclass=*)')
-    if len(c.entries) > 1:
-            print(str(len(c.entries) - 1) + " FGPP Objects found! \n\nAttempting to Enumerate objects with an applied policy...\n")
-            c.search(search_base=base_creator(args.domain), search_filter='(objectclass=*)',attributes=['DistinguishedName','msDS-PSOApplied'])
-            for entry in c.entries:
-                if str(entry['msDS-PSOApplied']) != "[]":
-                        print ("Object: " + str(entry['DistinguishedName']))
-                        print ("Applied Policy: " + str(entry['msDS-PSOApplied']))
-                        print("")           
-            print("Attempting to enumerate details...\n")
-            c.search(search_base=base_creator(args.domain), search_filter='(objectclass=msDS-PasswordSettings)',
-                     attributes=['name', 'msds-lockoutthreshold', 'msds-psoappliesto', 'msds-minimumpasswordlength',
-                                 'msds-passwordhistorylength', 'msds-lockoutobservationwindow', 'msds-lockoutduration',
-                                 'msds-passwordsettingsprecedence', 'msds-passwordcomplexityenabled', 'Description',
-                                 'msds-passwordreversibleencryptionenabled','msds-minimumpasswordage','msds-maximumpasswordage'])
-            if str(c.entries) != "[]":
-                    for entry in c.entries:
-                        print("Policy Name: " + str(entry['name']))
-                        if str(entry['description']) != "[]":
-                            print("Description: " + str(entry['description']))
-                        print("Minimum Password Length: " + str(entry['msds-minimumpasswordlength']))
-                        print("Minimum Password History Length: " + str(entry['msds-passwordhistorylength']))
-                        print("Lockout Threshold: " + str(entry['msds-lockoutthreshold']))
-                        print("Observation Window: " + clock(int(str(entry['msds-lockoutobservationwindow']))))
-                        print("Lockout Duration: " + clock(int(str(entry['msds-lockoutduration']))))
-                        print("Complexity Enabled: " + str(entry['msds-passwordcomplexityenabled']))
-                        print("Minimum Password Age " + clock(int(str(entry['msds-minimumpasswordage']))))
-                        print("Maximum Password Age: " + clock(int(str(entry['msds-maximumpasswordage']))))
-                        print("Reversible Encryption: " + str(entry['msds-passwordreversibleencryptionenabled']))
-                        print("Precedence: " + str(entry['msds-passwordsettingsprecedence']) + " (Lower is Higher Priority)")
-                        for dn in entry['msds-psoappliesto']:
-                            print("Policy Applies to: " + str(dn))
-                        print("")
-            else:
-                    print("Could not enumerate details, you likely do not have the privileges to do so!")
-    else:
-        print("No Fine Grained Password Policies found!")
+    conn = connect(args)
+    enumerate_fgpp(conn, args.domain)
+    enumerate_applied_objects(conn, args.domain)
+
 if __name__ == "__main__":
     main()
